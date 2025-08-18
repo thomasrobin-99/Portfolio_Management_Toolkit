@@ -4,6 +4,7 @@ import scipy.stats
 import matplotlib as plt
 from scipy.stats import norm
 from scipy.optimize import minimize
+import math
 
 def get_ffme_returns():
     """
@@ -74,7 +75,7 @@ def Vola_ann(r, period):
     return r.std()*(period**0.5)
 
 
-def Shrape_ratio(returns, rf, period):
+def Sharpe_ratio(returns, rf, period):
     """
     INPUTS
     Return series/ dataframe
@@ -83,13 +84,13 @@ def Shrape_ratio(returns, rf, period):
     """
     period_rf = (1+rf)**(1/period) -1
     excess_returns = returns - period_rf
-    ann_excess_returns = get_returns_ann(excess_returns, period)
-    return ann_excess_returns/get_vola_ann(returns, period)
+    ann_excess_returns = Returns_ann(excess_returns, period)
+    return ann_excess_returns/Vola_ann(returns, period)
 
 
 def Drawdown (return_series: pd.Series):
     """
-    Input Fataframe and returns a dataframe with welthindex, previouspeak and drawdown
+    Input Dataframe and returns a dataframe with wealthindex, previouspeak and drawdown
     """
     wealth_index = 1000*(return_series+1).cumprod()
     previous_peak = wealth_index.cummax()
@@ -148,7 +149,7 @@ def VaR_gaussian (r, level=5, modified=False):
 
 def cVaR_historic(r, level=5):
     if isinstance(r, pd.Series):
-        shortfall = r <= -VaRhistoric(r, level=level)
+        shortfall = r <= -VaR_historic(r, level=level)
         return -r[shortfall].mean()
     elif isinstance(r, pd.DataFrame):
         return r.aggregate(cVaR_historic, level=level)
@@ -256,3 +257,181 @@ def Efficient_frontier(n, rets, cov, cml=False, rf=0.0, ew=False, gmv=False, lin
         ax.text(gmv_v - 0.002, gmv_r, "GMV", ha='right', va = 'center', color='midnightblue', fontsize=8)
         
     return ax
+
+
+def CPPI(risky_r, safe_r=None, m=3, start=1000, floor=0.8, rf = 0.03, drawdown = None):
+    """
+    Run a backtest of CPPI strategy, given a set of returns for risky asset.
+    Returns a dictionary of History containing: Asset value, Risky budget, Risky weight
+    """
+    #setup parameters
+    dates = risky_r.index
+    n_steps = len(dates)
+    acc_val = start
+    flr_val = start * floor
+    peak = start
+    
+    if isinstance(risky_r, pd.Series):
+        risky_r = pd.DataFrame(risky_r, columns["R"])
+        
+    if safe_r is None:
+        safe_r = pd.DataFrame().reindex_like(risky_r)
+        safe_r.values[:] = rf/12
+        
+    #setup Df for saving history
+    acc_hist = pd.DataFrame().reindex_like(risky_r)
+    risky_w_hist = pd.DataFrame().reindex_like(risky_r)
+    cushion_hist = pd.DataFrame().reindex_like(risky_r)
+    
+    for step in range(n_steps):
+        if drawdown is not None:
+            peak = np.maximum(peak, acc_val)
+            flr_val = peak*(1-drawdown)
+        cushion = (acc_val - flr_val)/acc_val
+        risky_w = m*cushion
+        risky_w = np.minimum(risky_w, 1)
+        risky_w = np.maximum(risky_w, 0)
+        safe_w = 1-risky_w
+        risky_alloc = risky_w*acc_val
+        safe_alloc = safe_w*acc_val
+        #new account value
+        acc_val = risky_alloc*(1+risky_r.iloc[step]) + safe_alloc*(1+safe_r.iloc[step])
+        #save step history
+        acc_hist.iloc[step] = acc_val
+        risky_w_hist.iloc[step] = risky_w
+        cushion_hist.iloc[step] = cushion
+        
+    risky_wealth = start*(1+risky_r).cumprod()
+    backtest = {
+        "Wealth": acc_hist,
+        "Risky Wealth": risky_wealth,
+        "Risk Budget": cushion_hist,
+        "Risk Allocation": risky_w_hist,
+        "Floor": flr_val
+        
+    }
+    return backtest
+
+
+def Summary_stats(r, rf=0.03):
+    """
+    Return a summary of stats for all the columns in the returns df r
+    """
+    ann_r = r.aggregate(Returns_ann, period=12)
+    ann_v = r.aggregate(Vola_ann, period = 12)
+    ann_sr = r.aggregate(Sharpe_ratio, rf=rf, period=12)
+    dd = r.aggregate(lambda r: Drawdown(r).Drawdowns.min())
+    sk = r.aggregate(Skewness)
+    kr = r.aggregate(Kurtosis)
+    cf_var5 = r.aggregate(VaR_gaussian, modified=True)
+    hist_cvar = r.aggregate(cVaR_historic)
+    
+    return pd.DataFrame({
+        "Annualized Return": ann_r,
+        "Annualized Volatility": ann_v,
+        "Skewness": sk,
+        "Kurtosis": kr,
+        "Cornish-Fisher VaR(5%)":cf_var5,
+        "cVaR Historic (5%)": hist_cvar,
+        "Sharpe Ratio": ann_sr,
+        "Max Drawdown": dd
+    })
+
+
+def Gbm(n_years=10, n_scenarios=1000, steps_per_year=12, mu=0.07, sigma=0.15, s0=100, prices=True):
+    """
+    Evolution of Geometric Brownian Motion trajectories, such as for Stock Prices through Monte Carlo
+    :param n_years:  The number of years to generate data for
+    :param n_paths: The number of scenarios/trajectories
+    :param mu: Annualized Drift, e.g. Market Return
+    :param sigma: Annualized Volatility
+    :param steps_per_year: granularity of the simulation
+    :param s_0: initial value
+    :return: a numpy array of n_paths columns and n_years*steps_per_year rows
+    """
+    dt= 1/steps_per_year
+    n_steps = int(n_years * steps_per_year) + 1
+    rets_plus_1 = np.random.normal(loc=(mu*dt)+1, scale=(sigma*np.sqrt(dt)), size=(n_steps,n_scenarios))
+    rets_plus_1[0] = 1
+    
+    ret_val = s0*pd.DataFrame(rets_plus_1).cumprod() if prices else rets_plus_1-1
+    return ret_val
+
+
+def discount(t, r):
+    """
+    Compute the price of a pure discount bond that pays a dollar at time t where t is in years and r is the annual interest rate
+    """
+    return (1+r)**(-t)
+
+
+def pv(l, r):
+    """
+    Compute the present value of a list of liabilities given by the time (as an index) and amounts
+    """
+    dates = l.index
+    discounts = discount(dates, r)
+    return (discounts*l).sum()
+
+
+def funding_ratio(assets, liabilities, r):
+    """
+    Computes the funding ratio of a series of liabilities, based on an interest rate and current value of assets
+    """
+    return assets/pv(liabilities, r)
+
+
+def inst_to_ann(r):
+    """
+    Convert an instantaneous interest rate to an annual interest rate
+    """
+    return np.expm1(r)
+
+
+def ann_to_inst(r):
+    """
+    Convert an instantaneous interest rate to an annual interest rate
+    """
+    return np.log1p(r)
+
+
+def cir(n_years = 10, n_scenarios=1, a=0.05, b=0.03, sigma=0.05, steps_per_year=12, r_0=None):
+    """
+    Generate random interest rate evolution over time using the CIR model
+    b and r_0 are assumed to be the annualized rates, not the short rate
+    and the returned values are the annualized rates as well
+    """
+    if r_0 is None: r_0 = b 
+    r_0 = ann_to_inst(r_0)
+    dt = 1/steps_per_year
+    num_steps = int(n_years*steps_per_year) + 1 # because n_years might be a float
+    
+    shock = np.random.normal(0, scale=np.sqrt(dt), size=(num_steps, n_scenarios))
+    rates = np.empty_like(shock)
+    rates[0] = r_0
+
+    ## For Price Generation
+    h = math.sqrt(a**2 + 2*sigma**2)
+    prices = np.empty_like(shock)
+    ####
+
+    def price(ttm, r):
+        _A = ((2*h*math.exp((h+a)*ttm/2))/(2*h+(h+a)*(math.exp(h*ttm)-1)))**(2*a*b/sigma**2)
+        _B = (2*(math.exp(h*ttm)-1))/(2*h + (h+a)*(math.exp(h*ttm)-1))
+        _P = _A*np.exp(-_B*r)
+        return _P
+    prices[0] = price(n_years, r_0)
+    ####
+    
+    for step in range(1, num_steps):
+        r_t = rates[step-1]
+        d_r_t = a*(b-r_t)*dt + sigma*np.sqrt(r_t)*shock[step]
+        rates[step] = abs(r_t + d_r_t)
+        # generate prices at time t as well ...
+        prices[step] = price(n_years-step*dt, rates[step])
+
+    rates = pd.DataFrame(data=inst_to_ann(rates), index=range(num_steps))
+    ### for prices
+    prices = pd.DataFrame(data=prices, index=range(num_steps))
+    ###
+    return rates, prices
