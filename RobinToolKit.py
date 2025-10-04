@@ -5,6 +5,7 @@ import matplotlib as plt
 from scipy.stats import norm
 from scipy.optimize import minimize
 import math
+import statsmodels.api as sm
 
 def get_ffme_returns():
     """
@@ -28,34 +29,80 @@ def get_hfi_returns():
     return hfi
 
 
-def get_ind_returns():
+def get_ind_file(filetype, weighting="vw", n_inds=30):
     """
-    Load the industry returns dataset
-    """
-    ind = pd.read_csv("data/ind30_m_vw_rets.csv", index_col = 0, parse_dates = True)/100
+    Load and format the Ken French Industry Portfolios files
+    Variant is a tuple of (weighting, size) where:
+        weighting is one of "ew", "vw"
+        number of inds is 30 or 49
+    """    
+    if filetype is "returns":
+        name = f"{weighting}_rets" 
+        divisor = 100
+    elif filetype is "nfirms":
+        name = "nfirms"
+        divisor = 1
+    elif filetype is "size":
+        name = "size"
+        divisor = 1
+    else:
+        raise ValueError(f"filetype must be one of: returns, nfirms, size")
+    
+    ind = pd.read_csv(f"data/ind{n_inds}_m_{name}.csv", header=0, index_col=0, na_values=-99.99)/divisor
     ind.index = pd.to_datetime(ind.index, format="%Y%m").to_period('M')
     ind.columns = ind.columns.str.strip()
     return ind
 
+def get_ind_returns(weighting="vw", n_inds=30):
+    """
+    Load and format the Ken French Industry Portfolios Monthly Returns
+    """
+    return get_ind_file("returns", weighting=weighting, n_inds=n_inds)
 
-def get_ind_nfirms():
+def get_ind_nfirms(n_inds=30):
     """
-    Load the industry returns dataset
+    Load and format the Ken French 30 Industry Portfolios Average number of Firms
     """
-    ind = pd.read_csv("data/ind30_m_nfirms.csv", index_col = 0, parse_dates = True)
-    ind.index = pd.to_datetime(ind.index, format="%Y%m").to_period('M')
-    ind.columns = ind.columns.str.strip()
-    return ind
+    return get_ind_file("nfirms", n_inds=n_inds)
+
+def get_ind_size(n_inds=30):
+    """
+    Load and format the Ken French 30 Industry Portfolios Average size (market cap)
+    """
+    return get_ind_file("size", n_inds=n_inds)
+
+def get_ind_market_caps(n_inds=30, weights=False):
+    """
+    Load the industry portfolio data and derive the market caps
+    """
+    ind_nfirms = get_ind_nfirms(n_inds=n_inds)
+    ind_size = get_ind_size(n_inds=n_inds)
+    ind_mktcap = ind_nfirms * ind_size
+    if weights:
+        total_mktcap = ind_mktcap.sum(axis=1)
+        ind_capweight = ind_mktcap.divide(total_mktcap, axis="rows")
+        return ind_capweight
+    #else
+    return ind_mktcap
+
+def get_total_market_index_returns(n_inds=30):
+    """
+    Load the 30 industry portfolio data and derive the returns of a capweighted total market index
+    """
+    ind_capweight = get_ind_market_caps(n_inds=n_inds)
+    ind_return = get_ind_returns(weighting="vw", n_inds=n_inds)
+    total_market_return = (ind_capweight * ind_return).sum(axis="columns")
+    return total_market_return
 
 
-def get_ind_size():
+def get_fff_returns():
     """
-    Load the industry returns dataset
+    Load the Fama-French Research Factor Monthly Dataset
     """
-    ind = pd.read_csv("data/ind30_m_size.csv", index_col = 0, parse_dates = True)
-    ind.index = pd.to_datetime(ind.index, format="%Y%m").to_period('M')
-    ind.columns = ind.columns.str.strip()
-    return ind
+    rets = pd.read_csv("data/F-F_Research_Data_Factors_m.csv",
+                       header=0, index_col=0, na_values=-99.99)/100
+    rets.index = pd.to_datetime(rets.index, format="%Y%m").to_period('M')
+    return rets
 
 
 def Returns_ann(r, period):
@@ -111,6 +158,13 @@ def Kurtosis(r):
     """
     demeaned_r = r - r.mean()
     return (demeaned_r**4).mean()/(r.std(ddof = 0)**4)
+
+
+def compound(r):
+    """
+    returns the result of compounding the set of returns in r
+    """
+    return np.expm1(np.log1p(r).sum())
 
 
 def Semideviation (r):
@@ -272,7 +326,7 @@ def CPPI(risky_r, safe_r=None, m=3, start=1000, floor=0.8, rf = 0.03, drawdown =
     peak = start
     
     if isinstance(risky_r, pd.Series):
-        risky_r = pd.DataFrame(risky_r, columns["R"])
+        risky_r = pd.DataFrame(risky_r, columns=["R"])
         
     if safe_r is None:
         safe_r = pd.DataFrame().reindex_like(risky_r)
@@ -313,7 +367,7 @@ def CPPI(risky_r, safe_r=None, m=3, start=1000, floor=0.8, rf = 0.03, drawdown =
     return backtest
 
 
-def Summary_stats(r, rf=0.03):
+def summary_stats(r, rf=0.03):
     """
     Return a summary of stats for all the columns in the returns df r
     """
@@ -361,8 +415,11 @@ def Gbm(n_years=10, n_scenarios=1000, steps_per_year=12, mu=0.07, sigma=0.15, s0
 def discount(t, r):
     """
     Compute the price of a pure discount bond that pays a dollar at time t where t is in years and r is the annual interest rate
+    Compute this for a vector of t's and return a dataframe of discount factors for corresponding time
     """
-    return (1+r)**(-t)
+    discounts = pd.DataFrame([(1+r)**(-i) for i in t])
+    discounts.index = t
+    return discounts
 
 
 def pv(l, r):
@@ -371,7 +428,7 @@ def pv(l, r):
     """
     dates = l.index
     discounts = discount(dates, r)
-    return (discounts*l).sum()
+    return discounts.multiply(l, axis='rows').sum()
 
 
 def funding_ratio(assets, liabilities, r):
@@ -442,29 +499,41 @@ def cir(n_years = 10, n_scenarios=1, a=0.05, b=0.03, sigma=0.05, steps_per_year=
     return rates, prices
 
 
-def bond_cashflows(maturity, princpal = 100, coupon_rate=0.03, coupon_per_year=12 ):
+def bond_cashflows(maturity, principal = 100, coupon_rate=0.03, coupons_per_year=12 ):
     """
     Returns the series of cash flows generated by a bond,
     indexed by the payment/coupon number
     """
-    n_coupon = round(maturity*coupon_per_year)
-    coupon = princpal*coupon_rate/coupon_per_year
+    n_coupon = round(maturity*coupons_per_year)
+    coupon = principal*coupon_rate/coupons_per_year
     cashflows = np.repeat(coupon, n_coupon)
-    n_times = np.arrange(1, n_coupon+1)
-    bond_cashflows = pd.Series(data = cashflows, index=n_times)
-    bond_cashflows.iloc[-1] += princpal
+    n_times = np.arange(1, n_coupon+1)
+    bond_cashflows = pd.DataFrame(data = cashflows, index=n_times)
+    bond_cashflows.iloc[-1] += principal
     return bond_cashflows
 
 
-def bond_price(maturity, pricipal, coupon_rate, coupon_per_year, rf=0.05):
+def bond_price(maturity, principal=100, coupon_rate=0.03, coupons_per_year=12, discount_rate=0.03):
     """
     Computes the price of a bond that pays regular coupons until maturity
     at which time the principal and the final coupon is returned
     This is not designed to be efficient, rather,
     it is to illustrate the underlying principle behind bond pricing!
+    If discount_rate is a DataFrame, then this is assumed to be the rate on each coupon date
+    and the bond value is computed over time.
+    i.e. The index of the discount_rate DataFrame is assumed to be the coupon number
     """
-    cashflows = bond_cashflows(maturity, pricipal, coupon_rate, coupon_per_year)
-    return pv(cashflows, rf/coupon_per_year)
+    if isinstance(discount_rate, pd.DataFrame):
+        pricing_dates = discount_rate.index
+        prices = pd.DataFrame(index=pricing_dates, columns=discount_rate.columns)
+        for t in pricing_dates:
+            prices.loc[t] = bond_price(maturity-t/coupons_per_year, principal, coupon_rate, coupons_per_year,
+                                      discount_rate.loc[t])
+        return prices
+    else: # base case ... single time period
+        if maturity <= 0: return principal+principal*coupon_rate/coupons_per_year
+        cash_flows = bond_cashflows(maturity, principal, coupon_rate, coupons_per_year)
+        return pv(cash_flows, discount_rate/coupons_per_year)
 
 
 def macaulay_duration(cashflows, rf):
@@ -472,7 +541,7 @@ def macaulay_duration(cashflows, rf):
     Computes the Macaulay Duration of a sequence of cash flows, given a per-period discount rate
     """
     discounted_cflows = discount(cashflows.index, rf)*cashflows
-    weights = discounted_cflows/discounted_cflows.sum()
+    weights = (discounted_cflows/discounted_cflows.sum()).squeeze()
     return np.average(cashflows.index, weights=weights)
 
 def match_durations(cf_t, cf_s, cf_l, discount_rate):
@@ -485,3 +554,166 @@ def match_durations(cf_t, cf_s, cf_l, discount_rate):
     d_s = macaulay_duration(cf_s, discount_rate)
     d_l = macaulay_duration(cf_l, discount_rate)
     return (d_l - d_t)/(d_l - d_s)
+
+
+def bond_total_return(monthly_prices, principal, coupon_rate, coupons_per_year):
+    """
+    Computes the total return of a Bond based on monthly bond prices and coupon payments
+    Assumes that dividends (coupons) are paid out at the end of the period (e.g. end of 3 months for quarterly div)
+    and that dividends are reinvested in the bond
+    """
+    coupons = pd.DataFrame(data = 0, index=monthly_prices.index, columns=monthly_prices.columns)
+    t_max = monthly_prices.index.max()
+    pay_date = np.linspace(12/coupons_per_year, t_max, int(coupons_per_year*t_max/12), dtype=int)
+    coupons.iloc[pay_date] = principal*coupon_rate/coupons_per_year
+    total_returns = (monthly_prices + coupons)/monthly_prices.shift()-1
+    return total_returns.dropna()
+
+
+def tracking_error(r_a, r_b):
+    """
+    Returns the Tracking Error between the two return series
+    """
+    return np.sqrt(((r_a - r_b)**2).sum())
+
+
+def portfolio_tracking_error(weights, returns, benchmark):
+    """
+    Returns the tracking error between a portfolio and a benchmark. 
+    """
+    return tracking_error(returns, (weights*benchmark).sum(axis=1))  
+
+
+def regress(dependent_variable, explanatory_variables, alpha=True):
+    """
+    Runs a linear regression to decompose the dependent variable into the explanatory variables
+    returns an object of type statsmodel's RegressionResults on which you can call
+       .summary() to print a full summary
+       .params for the coefficients
+       .tvalues and .pvalues for the significance levels
+       .rsquared_adj and .rsquared for quality of fit
+    """
+    if alpha:
+        explanatory_variables = explanatory_variables.copy()
+        explanatory_variables["Alpha"] = 1
+    
+    lm = sm.OLS(dependent_variable, explanatory_variables).fit()
+    return lm
+
+                         
+def style_analysis(dependent_variable, explanatory_variables):
+    """
+    Returns the optimal weights that minimizes the Tracking error between
+    a portfolio of the explanatory variables and the dependent variable
+    """
+    n = explanatory_variables.shape[1]
+    init_guess = np.repeat(1/n, n)
+    bounds = ((0.0, 1.0),) * n # an N-tuple of 2-tuples!
+    # construct the constraints
+    weights_sum_to_1 = {'type': 'eq',
+                        'fun': lambda weights: np.sum(weights) - 1
+    }
+    solution = minimize(portfolio_tracking_error, init_guess,
+                       args=(dependent_variable, explanatory_variables,), method='SLSQP',
+                       options={'disp': False},
+                       constraints=(weights_sum_to_1,),
+                       bounds=bounds)
+    weights = pd.Series(solution.x, index=explanatory_variables.columns)
+    return weights
+
+
+def ff_analysis(r, factors):
+    """
+    Returns the loadings  of r on the Fama French Factors
+    which can be read in using get_fff_returns()
+    the index of r must be a (not necessarily proper) subset of the index of factors
+    r is either a Series or a DataFrame
+    """
+    if isinstance(r, pd.Series):
+        dependent_variable = r
+        explanatory_variables = factors.loc[r.index]
+        tilts = regress(dependent_variable, explanatory_variables).params
+    elif isinstance(r, pd.DataFrame):
+        tilts = pd.DataFrame({col: ff_analysis(r[col], factors) for col in r.columns})
+    else:
+        raise TypeError("r must be a Series or a DataFrame")
+    return tilts
+
+def weight_ew(r, cap_weights=None, max_cw_mult=None, microcap_threshold=None, **kwargs):
+    """
+    Returns the weights of the EW portfolio based on the asset returns "r" as a DataFrame
+    If supplied a set of capweights and a capweight tether, it is applied and reweighted 
+    """
+    n = len(r.columns)
+    ew = pd.Series(1/n, index=r.columns)
+    if cap_weights is not None:
+        cw = cap_weights.loc[r.index[0]] # starting cap weight
+        ## exclude microcaps
+        if microcap_threshold is not None and microcap_threshold > 0:
+            microcap = cw < microcap_threshold
+            ew[microcap] = 0
+            ew = ew/ew.sum()
+        #limit weight to a multiple of capweight
+        if max_cw_mult is not None and max_cw_mult > 0:
+            ew = np.minimum(ew, cw*max_cw_mult)
+            ew = ew/ew.sum() #reweight
+    return ew
+
+def weight_cw(r, cap_weights, **kwargs):
+    """
+    Returns the weights of the CW portfolio based on the time series of capweights
+    """
+    return cap_weights.loc[r.index[0]]
+
+
+def backtest_ws(r, estimation_window=60, weighting=weight_ew, verbose=False, **kwargs):
+    """
+    Backtests a given weighting scheme, given some parameters:
+    r : asset returns to use to build the portfolio
+    estimation_window: the window to use to estimate parameters
+    weighting: the weighting scheme to use, must be a function that takes "r", and a variable number of keyword-value arguments
+    """
+    n_periods = r.shape[0]
+    # return windows
+    windows = [(start, start+estimation_window) for start in range(n_periods-estimation_window)]
+    weights = [weighting(r.iloc[win[0]:win[1]], **kwargs) for win in windows]
+    # convert List of weights to DataFrame
+    weights = pd.DataFrame(weights, index=r.iloc[estimation_window:].index, columns=r.columns)
+    returns = (weights * r).sum(axis="columns",  min_count=1) #mincount is to generate NAs if all inputs are NAs
+    return returns
+
+
+def sample_cov(r, **kwargs):
+    """
+    computes the sample covariance of the returns r
+    """
+    return r.cov()
+
+
+def weight_gmv(r, cov_estimator=sample_cov, **kwargs):
+    cov = cov_estimator(r)
+    return gmv_weights(cov)
+
+
+def cc_cov(r, **kwargs):
+    """
+    Computes the constant correlation shrinkage estimator of the covariance matrix
+    """
+    rho = r.corr()
+    n = rho.shape[0]
+    rho_bar = (rho.values.sum()- n)/(n*(n-1))
+    c_corr = np.full_like(rho, rho_bar)
+    np.fill_diagonal(c_corr, 1)
+    sd = r.std()
+    c_cov = c_corr * np.outer(sd, sd)
+    return pd.DataFrame(c_cov, index=r.columns, columns=r.columns)
+
+
+def shrinkage_cov(r, delta=0.5, **kwargs):
+    """
+    Covariance estimator that shrinks between the Sample Covariance and the Constant Correlation Estimators
+    """
+    prior = cc_cov(r, **kwargs)
+    sample = sample_cov(r, **kwargs)
+    return delta*prior + (1-delta)*sample
+ 
